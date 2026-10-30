@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import os
 import random
 import re
+import string
 import sys
 import time
 import urllib.parse
@@ -723,6 +724,29 @@ def resolve_cycle_ua(used_uas_in_cycle: set) -> tuple:
     return cat, ua, label
 
 
+def resolve_override_ua(used_uas_in_cycle: set, override_dev_str: str) -> tuple:
+    tree = parse_nested_device_spec(override_dev_str)
+    cats = list(tree.keys())
+    cat = random.choice(cats) if cats else "mobile"
+
+    sub_os_dict = tree.get(cat, {})
+    if not sub_os_dict:
+        sub_os_dict = {"android": ["chrome"]} if cat == "mobile" else {"windows": ["chrome"]}
+
+    chosen_os = random.choice(list(sub_os_dict.keys()))
+    allowed_browsers = sub_os_dict.get(chosen_os, ["chrome"])
+    chosen_browser = pick_browser_for_os(chosen_os, allowed_browsers, NATIVE_RATIO)
+    
+    ua, label = "", ""
+    for _ in range(15):
+        ua, label = get_ua_for_selection(cat, chosen_os, chosen_browser)
+        if ua not in used_uas_in_cycle:
+            break
+
+    used_uas_in_cycle.add(ua)
+    return cat, ua, label
+
+
 # ---------------------------------------------------------
 # Full Datacenter Catalog & 3-Tier Classification
 # ---------------------------------------------------------
@@ -895,6 +919,17 @@ def pick_datacenter_country(used_countries_in_cycle: set):
 
     return "DC", "US", "us"
 
+def pick_override_country(override_cc_str: str):
+    codes = [c.strip().upper() for c in override_cc_str.split(',') if c.strip()]
+    if not codes:
+        return "OVR-US", "US", "us"
+    c_up = random.choice(codes)
+    tier = "OVR"
+    if c_up in TIER_1_CODES: tier = "T1"
+    elif c_up in TIER_2_CODES: tier = "T2"
+    elif c_up in TIER_3_CODES: tier = "T3"
+    return f"{tier}-{c_up}", c_up, c_up.lower()
+
 
 # ---------------------------------------------------------
 # Dynamic Slug & Link Engine (Non-Repeating per Cycle)
@@ -1050,6 +1085,39 @@ class KeyPoolManager:
 
 
 # ---------------------------------------------------------
+# Map Links Parser & Validator (Strict Syntax Check)
+# ---------------------------------------------------------
+def parse_and_validate_map_links(raw_str: str) -> list:
+    parsed_list = []
+    if not raw_str.strip():
+        return parsed_list
+        
+    # Split by comma but ignore commas inside brackets like {us,uk}
+    raw_items = [item.strip() for item in re.split(r",(?![^{]*\})", raw_str) if item.strip()]
+    
+    for raw in raw_items:
+        # Strictly matches exact sequence, enforcing spaces between optional items
+        pattern = r"^(?P<url>[^\s{]+)(?:\s+\{(?P<rep>[^}]*)\})?(?:\s+(?P<dev>(?:desktop|mobile)(?:\{[^}]*\})?))?(?:\s+\{(?P<cc>[a-zA-Z,]+)\})?$"
+        match = re.match(pattern, raw, re.IGNORECASE)
+        
+        if not match:
+            print("\n" + "!" * 70)
+            print(" [CRITICAL SYNTAX ERROR] INVALID MAP_LINK FORMAT DETECTED!")
+            print(f" Malformed Link : {raw}")
+            print(" Reason         : Missing spaces between arguments, or invalid bracket usage.")
+            print(" Proper format  : URL {REPLACE_STR} DEVICE_SPEC {COUNTRY}")
+            print(" Valid Example  : http://target.com?id=123 {123} desktop{windows} {us}")
+            print(" Skip Replace Ex: http://target.com {} desktop {us}")
+            print(" Execution Terminated immediately to prevent traffic corruption.")
+            print("!" * 70 + "\n")
+            sys.exit(1)
+            
+        parsed_list.append(match.groupdict())
+        
+    return parsed_list
+
+
+# ---------------------------------------------------------
 # Global Parameters & Dispatcher Initialization
 # ---------------------------------------------------------
 RAW_KEYS = get_env("API_KEYS", get_env("SCRAPERAPI_KEYS", ""))
@@ -1060,12 +1128,12 @@ CYCLE_GAP = parse_num("CYCLE_GAP", default=0.0)
 
 FOLLOW_REDIRECT = parse_bool("FOLLOW_REDIRECT", default=False)
 MATCH_IP_LANGUAGE = parse_bool("LANGUAGE_ACCORDING_TO_IP", default=False)
-WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 5, 7)
+WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1, 3)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
-BROWSER_RENDERING = get_env("BROWSER_RENDERING", "true").lower()
+BROWSER_RENDERING = get_env("BROWSER_RENDERING", "false").lower()
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
 DEFAULT_REFERRERS = [
@@ -1087,6 +1155,11 @@ INPUT_LINKS = parse_list("LINKS", parse_list("TARGET_URLS", parse_list("TARGET_S
 SHORT_TEMPLATE = get_env("SHORT_LINK_TEMPLATE")
 LINK_DISPATCHER = CycleLinkDispatcher(INPUT_LINKS, SHORT_TEMPLATE)
 
+# MAP LINKS Validation
+RAW_MAP_LINKS = get_env("MAP_LINKS", "")
+PARSED_MAP_LINKS = parse_and_validate_map_links(RAW_MAP_LINKS)
+MAP_LINKS_RATIO = parse_native_ratio("MAP_LINKS_RATIO", default_pct=50.0)
+
 def calculate_credits(render_flag: str, is_residential: bool) -> int:
     is_render = render_flag == "true"
     if is_residential and is_render:
@@ -1095,6 +1168,50 @@ def calculate_credits(render_flag: str, is_residential: bool) -> int:
         return 10
     return 1
 
+# ---------------------------------------------------------
+# Dynamic Task Generator (Merging LINKS & MAP_LINKS)
+# ---------------------------------------------------------
+def generate_combined_tasks(worker_count: int):
+    tasks = []
+    has_std = bool(LINK_DISPATCHER.full_links or LINK_DISPATCHER.explicit_short_links)
+    has_map = bool(PARSED_MAP_LINKS)
+    
+    num_map = 0
+    num_std = 0
+    
+    for _ in range(worker_count):
+        if has_map and has_std:
+            if random.random() < MAP_LINKS_RATIO:
+                num_map += 1
+            else:
+                num_std += 1
+        elif has_map:
+            num_map += 1
+        else:
+            num_std += 1
+            
+    std_tasks = LINK_DISPATCHER.generate_cycle_batch(num_std)
+    std_tasks = [(t[0], t[1], t[2], None, None) for t in std_tasks]
+    
+    map_tasks = []
+    for _ in range(num_map):
+        map_data = random.choice(PARSED_MAP_LINKS)
+        url_tmpl = map_data["url"]
+        rep = map_data["rep"]
+        dev = map_data["dev"]
+        cc = map_data["cc"]
+
+        if rep:
+            rand_str = ''.join(random.choices(string.ascii_letters + string.digits, k=len(rep)))
+            target = url_tmpl.replace(rep, rand_str)
+        else:
+            target = url_tmpl
+
+        map_tasks.append((target, "map_link", "MAP", dev, cc))
+            
+    combined = std_tasks + map_tasks
+    random.shuffle(combined)
+    return combined
 
 # ---------------------------------------------------------
 # Worker Bot Execution
@@ -1216,23 +1333,39 @@ def main():
 
     print_datacenter_countries_table()
 
-    if not INPUT_LINKS:
+    if not INPUT_LINKS and not PARSED_MAP_LINKS:
         print("\n" + "!" * 70)
         print(" [CONFIG ERROR] NO TARGET LINKS DETECTED!")
-        print(" Supply target links via LINKS environment variable.")
+        print(" Supply target links via LINKS or MAP_LINKS environment variables.")
         print("!" * 70 + "\n")
         sys.exit(1)
+
+    print("---------------- MAP LINKS CONFIGURATION ---------")
+    if PARSED_MAP_LINKS:
+        for idx, m in enumerate(PARSED_MAP_LINKS, 1):
+            rep_disp = f"'{m['rep']}' (Length: {len(m['rep'])})" if (m['rep'] is not None and m['rep'] != "") else "NONE"
+            dev_disp = m['dev'] if m['dev'] else "NONE"
+            cc_disp = m['cc'].upper() if m['cc'] else "NONE"
+            
+            print(f"[{idx}] Target : {truncate_url(m['url'], 40, 20)}")
+            print(f"    Replace  : {rep_disp}")
+            print(f"    Device   : {dev_disp}")
+            print(f"    Country  : {cc_disp}")
+    else:
+        print("    No Map Links configured.")
 
     inc_display = ", ".join(sorted(list(INC_COUNTRIES))) if INC_COUNTRIES else "None (ALL allowed)"
     exc_display = ", ".join(sorted(list(EXC_COUNTRIES))) if EXC_COUNTRIES else "None"
     
-    print("---------------- COUNTRY CONFIGURATION -----------")
+    print("---------------- GENERAL CONFIGURATION -----------")
     print(f"Included Countries      : {inc_display}")
     print(f"Excluded Countries      : {exc_display}")
     print(f"Working Datacenter Pool : {TOTAL_VALID} active (T1: {len(VALID_T1)} | T2: {len(VALID_T2)} | T3: {len(VALID_T3)})")
     print(f"Tier Selection Ratios   : T1={T1_RATIO:.1f}% | T2={T2_RATIO:.1f}% | T3={T3_RATIO:.1f}%")
     print(f"Route Change Fallback   : {ROUTE_CHANGE_ON_UNAVAILABLE} (Default: False)")
     print("--------------------------------------------------")
+    print(f"Standard Links Available: {len(LINK_DISPATCHER.full_links) + len(LINK_DISPATCHER.explicit_short_links)}")
+    print(f"Map Links Available     : {len(PARSED_MAP_LINKS)} (50-50 Split: {int(MAP_LINKS_RATIO * 100)}%)")
     print(f"Follow Redirects        : {FOLLOW_REDIRECT}")
     print(f"Total Active Keys       : {len(pool.active_keys)}")
     print(f"Parallel Bots Enabled   : {PARALLELBOT}")
@@ -1265,20 +1398,28 @@ def main():
 
             print(f"\n--- [Cycle #{cycle_num}] Starting {worker_count} bots | Target: {target_cycle_time:.1f}s | Active Keys: {len(pool.active_keys)} ---")
 
-            tasks = LINK_DISPATCHER.generate_cycle_batch(worker_count)
+            tasks = generate_combined_tasks(worker_count)
             
-            # Unique User Agents per cycle
+            bot_ua_assignments = []
+            bot_country_assignments = []
             used_uas_this_cycle = set()
-            bot_ua_assignments = [resolve_cycle_ua(used_uas_this_cycle) for _ in range(worker_count)]
-            
-            # Unique Countries per cycle
             used_countries_this_cycle = set()
-            bot_country_assignments = [pick_datacenter_country(used_countries_this_cycle) for _ in range(worker_count)]
+            
+            for _, _, _, override_dev, override_cc in tasks:
+                if override_dev:
+                    bot_ua_assignments.append(resolve_override_ua(used_uas_this_cycle, override_dev))
+                else:
+                    bot_ua_assignments.append(resolve_cycle_ua(used_uas_this_cycle))
+                    
+                if override_cc:
+                    bot_country_assignments.append(pick_override_country(override_cc))
+                else:
+                    bot_country_assignments.append(pick_datacenter_country(used_countries_this_cycle))
 
             if PARALLELBOT:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                     futures = []
-                    for idx, (url, slug, ltype) in enumerate(tasks):
+                    for idx, (url, slug, ltype, _, _) in enumerate(tasks):
                         stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
                         
                         cat, ua_str, ua_label = bot_ua_assignments[idx]
@@ -1292,7 +1433,7 @@ def main():
                         )
                     concurrent.futures.wait(futures)
             else:
-                for idx, (url, slug, ltype) in enumerate(tasks):
+                for idx, (url, slug, ltype, _, _) in enumerate(tasks):
                     stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
                     
                     cat, ua_str, ua_label = bot_ua_assignments[idx]
